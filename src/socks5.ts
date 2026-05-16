@@ -77,7 +77,7 @@ export function startSocks5Proxy(port: number): Promise<number> {
       client.on("error", () => {});
     });
 
-    server.listen(port, () => {
+    server.listen(port, "0.0.0.0", () => {
       const addr = server.address()!;
       const actualPort = typeof addr === "object" ? addr.port : port;
       console.log(`[${now()}] client socks5 proxy on ${actualPort}`);

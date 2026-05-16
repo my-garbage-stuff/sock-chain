@@ -86,7 +86,7 @@ export function startServer(listenPort: number, controlPort: number) {
       }
     });
     s.on("error", () => {});
-  }).listen(controlPort, () => console.log(`[${now()}] server control on ${controlPort}`));
+  }).listen(controlPort, "0.0.0.0", () => console.log(`[${now()}] server control on ${controlPort}`));
 
   // Forward port — users connect here
   net.createServer((user) => {
@@ -122,5 +122,5 @@ export function startServer(listenPort: number, controlPort: number) {
       if (st) st.userQueues.delete(connId);
     });
     user.on("error", () => {});
-  }).listen(listenPort, () => console.log(`[${now()}] server forward on ${listenPort}`));
+  }).listen(listenPort, "0.0.0.0", () => console.log(`[${now()}] server forward on ${listenPort}`));
 }
