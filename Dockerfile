@@ -1,13 +1,14 @@
-FROM oven/bun:1 AS build
+FROM debian:stable as build
 
 WORKDIR /app
-COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile
+COPY ./ ./
+RUN apt update && apt install curl unzip -yq
+RUN curl -fsSL https://bun.com/install | bash
+RUN /root/.bun/bin/bun install --frozen-lockfile
 
-COPY src/ ./src/
-RUN bun build src/index.ts --outfile=/app/sock-chain --compile --target=bun-linux-x86_64
+RUN ls && /root/.bun/bin/bun build src/index.ts --outfile=/app/sock-chain --compile --target=bun-linux-x86_64
 
-FROM gcr.io/distroless/cc-debian12
+FROM debian:stable
 
 COPY --from=build /app/sock-chain /usr/local/bin/sock-chain
 
