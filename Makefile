@@ -1,5 +1,5 @@
 # Build with bun (produces a native executable)
-SRC := ./index.ts
+SRC := ./src/index.ts
 
 TARGET := linux-x86_64 windows-x64
 
