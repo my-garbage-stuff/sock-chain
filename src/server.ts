@@ -9,8 +9,10 @@ interface ClientState {
 
 export function startServer(listenPort: number, controlPort: number) {
   const clients = new Map<net.Socket, ClientState>();
-  const clientConns = new Map<number, net.Socket>();  // connId → client socket
-  const users = new Map<number, net.Socket>();          // connId → user socket
+  const clientConns = new Map<number, net.Socket>();
+  const users = new Map<number, net.Socket>();
+  const userDraining = new Set<net.Socket>();
+  const ctrlDraining = new Set<net.Socket>();
   let nextConnId = 1;
 
   function pickClient(): net.Socket | null {
@@ -24,7 +26,13 @@ export function startServer(listenPort: number, controlPort: number) {
     if (!user) return;
     while (q.length > 0) {
       if (!user.write(q[0]!)) {
-        user.once("drain", () => flushUser(connId, q));
+        if (!userDraining.has(user)) {
+          userDraining.add(user);
+          user.once("drain", () => {
+            userDraining.delete(user);
+            flushUser(connId, q);
+          });
+        }
         return;
       }
       q.shift();
@@ -47,7 +55,13 @@ export function startServer(listenPort: number, controlPort: number) {
             let q = st.userQueues.get(f.connId);
             if (!q) { q = []; st.userQueues.set(f.connId, q); }
             q.push(f.payload);
-            user.once("drain", () => flushUser(f.connId, q));
+            if (!userDraining.has(user)) {
+              userDraining.add(user);
+              user.once("drain", () => {
+                userDraining.delete(user);
+                flushUser(f.connId, q);
+              });
+            }
           }
         } else if (f.type === FRAME_CLOSE) {
           const user = users.get(f.connId);
@@ -62,7 +76,6 @@ export function startServer(listenPort: number, controlPort: number) {
     s.on("close", () => {
       console.log(`[${now()}] [-] client ${ctrlAddr} (${clients.size - 1} connected)`);
       clients.delete(s);
-      // Kill all user connections that were routed through this client
       for (const [connId, cs] of clientConns) {
         if (cs === s) {
           const user = users.get(connId);
@@ -91,7 +104,13 @@ export function startServer(listenPort: number, controlPort: number) {
     user.on("data", (d: string | Buffer) => {
       if (!writeFrame(c, connId, FRAME_DATA, toBuf(d))) {
         user.pause();
-        c.once("drain", () => { if (!user.destroyed) user.resume(); });
+        if (!ctrlDraining.has(c)) {
+          ctrlDraining.add(c);
+          c.once("drain", () => {
+            ctrlDraining.delete(c);
+            if (!user.destroyed) user.resume();
+          });
+        }
       }
     });
     user.on("close", () => {

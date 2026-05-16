@@ -8,6 +8,8 @@ export function startClient(serverHost: string, serverPort: number, proxyPort: n
   const proxyConns = new Map<number, net.Socket>();
   const pending = new Map<number, Buffer[]>();
   const frameStream = new FrameStream();
+  const ctrlDraining = new Set<net.Socket>();
+  const proxyDraining = new Set<net.Socket>();
 
   const ctrl = net.createConnection({ host: serverHost, port: serverPort }, () =>
     console.log(`[${now()}] client connected to ${serverHost}:${serverPort}`));
@@ -25,7 +27,13 @@ export function startClient(serverHost: string, serverPort: number, proxyPort: n
             const data = toBuf(pd);
             if (!writeFrame(ctrl, f.connId, FRAME_DATA, data)) {
               proxy.pause();
-              ctrl.once("drain", () => { if (!proxy.destroyed) proxy.resume(); });
+              if (!ctrlDraining.has(ctrl)) {
+                ctrlDraining.add(ctrl);
+                ctrl.once("drain", () => {
+                  ctrlDraining.delete(ctrl);
+                  if (!proxy.destroyed) proxy.resume();
+                });
+              }
             }
           });
           proxy.on("close", () => {
@@ -44,19 +52,26 @@ export function startClient(serverHost: string, serverPort: number, proxyPort: n
         const proxy = proxyConns.get(f.connId);
         if (proxy && !proxy.destroyed && proxy.readyState === "open") {
           if (!proxy.write(f.payload)) {
-            const proxy2 = proxy;
             let q = pending.get(f.connId);
             if (!q) { q = []; pending.set(f.connId, q); }
             q.push(f.payload);
-            proxy2.once("drain", () => {
-              const q2 = pending.get(f.connId);
-              if (!q2) return;
-              while (q2.length > 0) {
-                if (!proxy2.write(q2[0]!)) { proxy2.once("drain", () => {}); return; }
-                q2.shift();
-              }
-              pending.delete(f.connId);
-            });
+            if (!proxyDraining.has(proxy)) {
+              proxyDraining.add(proxy);
+              const flush = () => {
+                const q2 = pending.get(f.connId);
+                if (!q2) { proxyDraining.delete(proxy); return; }
+                while (q2.length > 0) {
+                  if (!proxy.write(q2[0]!)) {
+                    proxy.once("drain", flush);
+                    return;
+                  }
+                  q2.shift();
+                }
+                pending.delete(f.connId);
+                proxyDraining.delete(proxy);
+              };
+              proxy.once("drain", flush);
+            }
           }
         } else {
           let q = pending.get(f.connId);
