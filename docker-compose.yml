@@ -1,0 +1,9 @@
+services:
+  server:
+    build: .
+    command: --server --port 1080 --control-port 2080
+    ports:
+      - "1080:1080"
+      - "2080:2080"
+    restart: unless-stopped
+
