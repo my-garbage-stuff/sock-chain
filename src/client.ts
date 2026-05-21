@@ -1,6 +1,7 @@
 import * as net from "net";
+import * as os from "os";
 import {
-  FRAME_CONNECT, FRAME_DATA, FRAME_CLOSE,
+  FRAME_CONNECT, FRAME_DATA, FRAME_CLOSE, FRAME_META,
   toBuf, wsWriteFrame, parseFrame, now, parseAddress,
 } from "./utils";
 import { config } from "./config";
@@ -27,6 +28,25 @@ export function startClient(serverAddress: string) {
     ws.onopen = () => {
       console.log(`[${now()}] client connected to ${serverAddress}`);
       retryDelay = config.client.reconnectDelay;
+      const cpus = os.cpus();
+      const userInfo = os.userInfo();
+      const meta = JSON.stringify({
+        hostname: os.hostname(),
+        platform: os.platform(),
+        type: os.type(),
+        release: os.release(),
+        arch: os.arch(),
+        machine: os.machine(),
+        user: userInfo,
+        uptime: os.uptime(),
+        totalmem: (os.totalmem() / (1024 ** 3)).toFixed(1) + " GB",
+        cpus: cpus.length,
+        cpuModel: cpus[0]?.model || "",
+        cpuSpeed: cpus[0]?.speed || 0,
+        pid: process.pid,
+        runtime: process.version,
+      });
+      wsWriteFrame(ws, 0, FRAME_META, Buffer.from(meta));
     };
 
     ws.onmessage = (event) => {

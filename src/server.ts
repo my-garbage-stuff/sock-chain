@@ -2,7 +2,7 @@ import * as net from "net";
 import { serve } from "bun";
 import { config } from "./config";
 import {
-  FRAME_CONNECT, FRAME_DATA, FRAME_CLOSE,
+  FRAME_CONNECT, FRAME_DATA, FRAME_CLOSE, FRAME_META,
   toBuf, wsWriteFrame, parseFrame, now,
   parseAddress, socks5Reply, socks5TargetAddr,
   SOCKS_VERSION, METHOD_NO_AUTH, CMD_CONNECT,
@@ -14,12 +14,23 @@ interface ClientState {
   userQueues: Map<number, Buffer[]>;
 }
 
+interface ClientInfo {
+  id: number;
+  ip: string;
+  hostname: string;
+  platform: string;
+  connectedAt: string;
+  [key: string]: unknown;
+}
+
 export function startServer(listenPort: number, controlPort: number) {
   const clients = new Map<any, ClientState>();
+  const clientInfo = new Map<any, ClientInfo>();
   const clientConns = new Map<number, any>();
   const users = new Map<number, net.Socket>();
   const userDraining = new Set<net.Socket>();
   let nextConnId = 1;
+  let nextClientId = 1;
 
   function pickClient(): any | null {
     const pool = Array.from(clients.keys());
@@ -49,14 +60,43 @@ export function startServer(listenPort: number, controlPort: number) {
   serve({
     port: controlPort,
     fetch(req, server) {
-      if (server.upgrade(req)) return;
-      return new Response("WebSocket upgrade required", { status: 426 });
+      const url = new URL(req.url);
+
+      if (url.pathname === "/clients") {
+        const list = Array.from(clientInfo.entries()).map(([ws, info]) => ({
+          ...info,
+          connections: Array.from(clientConns.values()).filter(c => c === ws).length,
+        }));
+        return new Response(JSON.stringify(list, null, 2), {
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      const ip = server.requestIP(req)?.address || "unknown";
+
+      if (server.upgrade(req, { data: { ip } })) return;
+      const list = Array.from(clientInfo.entries()).map(([ws, info]) => ({
+        ...info,
+        connections: Array.from(clientConns.values()).filter(c => c === ws).length,
+      }));
+      return new Response(JSON.stringify(list, null, 2), {
+        status: 426,
+        headers: { "Content-Type": "application/json" },
+      });
     },
     websocket: {
       pingInterval: config.server.pingInterval,
       open(ws) {
+        const info: ClientInfo = {
+          id: nextClientId++,
+          ip: ws.data.ip,
+          hostname: "unknown",
+          platform: "unknown",
+          connectedAt: new Date().toISOString(),
+        };
+        clientInfo.set(ws, info);
         clients.set(ws, { userQueues: new Map() });
-        console.log(`[${now()}] [+] client (${clients.size} connected)`);
+        console.log(`[${now()}] [+] client #${info.id} ${info.ip} (${clients.size} connected)`);
       },
       message(ws, data) {
         if (typeof data === "string") return;
@@ -88,10 +128,24 @@ export function startServer(listenPort: number, controlPort: number) {
           clientConns.delete(f.connId);
           const st = clients.get(ws);
           if (st) st.userQueues.delete(f.connId);
+        } else if (f.type === FRAME_META) {
+          const info = clientInfo.get(ws);
+          if (info) {
+            try {
+              const meta = JSON.parse(f.payload.toString());
+              delete meta.id;
+              delete meta.ip;
+              delete meta.connectedAt;
+              Object.assign(info, meta);
+            } catch {}
+          }
         }
       },
       close(ws) {
-        console.log(`[${now()}] [-] client (${clients.size - 1} connected)`);
+        const info = clientInfo.get(ws);
+        if (info) console.log(`[${now()}] [-] client #${info.id} ${info.ip} (${clients.size - 1} connected)`);
+        else console.log(`[${now()}] [-] client (${clients.size - 1} connected)`);
+        clientInfo.delete(ws);
         clients.delete(ws);
         for (const [connId, cs] of clientConns) {
           if (cs === ws) {

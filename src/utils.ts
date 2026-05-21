@@ -5,6 +5,7 @@ import * as net from "net";
 export const FRAME_CONNECT = 0x01;
 export const FRAME_DATA    = 0x02;
 export const FRAME_CLOSE   = 0x03;
+export const FRAME_META    = 0x04;
 export const HDR_SIZE = 9;
 
 // ── SOCKS5 constants ──
