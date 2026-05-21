@@ -1,5 +1,6 @@
 import * as net from "net";
 import { serve } from "bun";
+import { config } from "./config";
 import {
   FRAME_CONNECT, FRAME_DATA, FRAME_CLOSE,
   toBuf, wsWriteFrame, parseFrame, now,
@@ -52,6 +53,7 @@ export function startServer(listenPort: number, controlPort: number) {
       return new Response("WebSocket upgrade required", { status: 426 });
     },
     websocket: {
+      pingInterval: config.server.pingInterval,
       open(ws) {
         clients.set(ws, { userQueues: new Map() });
         console.log(`[${now()}] [+] client (${clients.size} connected)`);

@@ -61,9 +61,7 @@ export const config = {
 --server              Server mode
 --port <n>            SOCKS5 forward port (default: 1080)
 --control-port <n>    Client control port (default: 2080)
---server-host <host>  Server address for client mode
---server-port <n>     Server control port for client mode
---proxy-port <n>      Local SOCKS5 proxy port (0 = random)
+--connect <host>  Server address for client mode
 --help                Show this help
 ```
 
