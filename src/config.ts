@@ -4,11 +4,9 @@ export const config = {
     controlPort: 2080,
   },
   client: {
-    serverHost: "127.0.0.1",
-    serverPort: 2080,
-    proxyPort: 0,
+    serverAddress: "ws://127.0.0.1:2080",
   },
-  socks5: {
-    targetTimeout: 15000,
+  target: {
+    timeout: 15000,
   },
 };

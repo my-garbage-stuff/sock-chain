@@ -1,97 +1,97 @@
 import * as net from "net";
 import {
   FRAME_CONNECT, FRAME_DATA, FRAME_CLOSE,
-  toBuf, writeFrame, FrameStream, now,
+  toBuf, wsWriteFrame, parseFrame, now, parseAddress,
 } from "./utils";
+import { config } from "./config";
 
-export function startClient(serverHost: string, serverPort: number, proxyPort: number) {
-  const proxyConns = new Map<number, net.Socket>();
+export function startClient(serverAddress: string) {
+  const targets = new Map<number, net.Socket>();
   const pending = new Map<number, Buffer[]>();
-  const frameStream = new FrameStream();
-  const ctrlDraining = new Set<net.Socket>();
-  const proxyDraining = new Set<net.Socket>();
+  const targetDraining = new Set<net.Socket>();
 
-  const ctrl = net.createConnection({ host: serverHost, port: serverPort }, () =>
-    console.log(`[${now()}] client connected to ${serverHost}:${serverPort}`));
+  const ws = new WebSocket(serverAddress);
+  ws.binaryType = "nodebuffer";
 
-  ctrl.on("data", (d: string | Buffer) => {
-    for (const f of frameStream.push(toBuf(d))) {
-      if (f.type === FRAME_CONNECT) {
-        const proxy = net.createConnection({ host: "127.0.0.1", port: proxyPort }, () => {
-          const buf = pending.get(f.connId);
-          if (buf) {
-            for (const chunk of buf) proxy.write(chunk);
-            pending.delete(f.connId);
-          }
-          proxy.on("data", (pd: string | Buffer) => {
-            const data = toBuf(pd);
-            if (!writeFrame(ctrl, f.connId, FRAME_DATA, data)) {
-              proxy.pause();
-              if (!ctrlDraining.has(ctrl)) {
-                ctrlDraining.add(ctrl);
-                ctrl.once("drain", () => {
-                  ctrlDraining.delete(ctrl);
-                  if (!proxy.destroyed) proxy.resume();
-                });
-              }
-            }
-          });
-          proxy.on("close", () => {
-            writeFrame(ctrl, f.connId, FRAME_CLOSE, Buffer.alloc(0));
-            proxyConns.delete(f.connId);
-          });
-          proxy.on("error", () => {});
-        });
-        proxy.on("error", (e: Error) => {
-          console.log(`[${now()}] proxy#${f.connId}: ${e.message}`);
+  ws.onopen = () => {
+    console.log(`[${now()}] client connected to ${serverAddress}`);
+  };
+
+  ws.onmessage = (event) => {
+    const data = event.data;
+    if (typeof data === "string") return;
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    const f = parseFrame(buf);
+
+    if (f.type === FRAME_CONNECT) {
+      const { addr, port } = parseAddress(f.payload, 0);
+      const target = net.createConnection({ host: addr, port }, () => {
+        target.setTimeout(0);
+        const q = pending.get(f.connId);
+        if (q) {
+          for (const chunk of q) target.write(chunk);
           pending.delete(f.connId);
-          proxyConns.delete(f.connId);
+        }
+        target.on("data", (pd: string | Buffer) => {
+          wsWriteFrame(ws, f.connId, FRAME_DATA, toBuf(pd));
         });
-        proxyConns.set(f.connId, proxy);
-      } else if (f.type === FRAME_DATA) {
-        const proxy = proxyConns.get(f.connId);
-        if (proxy && !proxy.destroyed && proxy.readyState === "open") {
-          if (!proxy.write(f.payload)) {
-            let q = pending.get(f.connId);
-            if (!q) { q = []; pending.set(f.connId, q); }
-            q.push(f.payload);
-            if (!proxyDraining.has(proxy)) {
-              proxyDraining.add(proxy);
-              const flush = () => {
-                const q2 = pending.get(f.connId);
-                if (!q2) { proxyDraining.delete(proxy); return; }
-                while (q2.length > 0) {
-                  if (!proxy.write(q2[0]!)) {
-                    proxy.once("drain", flush);
-                    return;
-                  }
-                  q2.shift();
-                }
-                pending.delete(f.connId);
-                proxyDraining.delete(proxy);
-              };
-              proxy.once("drain", flush);
-            }
-          }
-        } else {
+        target.on("close", () => {
+          wsWriteFrame(ws, f.connId, FRAME_CLOSE, Buffer.alloc(0));
+          targets.delete(f.connId);
+        });
+        target.on("error", () => {});
+      });
+      target.on("error", (e: Error) => {
+        console.log(`[${now()}] target#${f.connId} ${addr}:${port}: ${e.message}`);
+        pending.delete(f.connId);
+        targets.delete(f.connId);
+        wsWriteFrame(ws, f.connId, FRAME_CLOSE, Buffer.alloc(0));
+      });
+      targets.set(f.connId, target);
+    } else if (f.type === FRAME_DATA) {
+      const target = targets.get(f.connId);
+      if (target && !target.destroyed && target.readyState === "open") {
+        if (!target.write(f.payload)) {
           let q = pending.get(f.connId);
           if (!q) { q = []; pending.set(f.connId, q); }
           q.push(f.payload);
+          if (!targetDraining.has(target)) {
+            targetDraining.add(target);
+            const flush = () => {
+              const q2 = pending.get(f.connId);
+              if (!q2) { targetDraining.delete(target); return; }
+              while (q2.length > 0) {
+                if (!target.write(q2[0]!)) {
+                  target.once("drain", flush);
+                  return;
+                }
+                q2.shift();
+              }
+              pending.delete(f.connId);
+              targetDraining.delete(target);
+            };
+            target.once("drain", flush);
+          }
         }
-      } else if (f.type === FRAME_CLOSE) {
-        const proxy = proxyConns.get(f.connId);
-        if (proxy) proxy.end();
-        proxyConns.delete(f.connId);
-        pending.delete(f.connId);
+      } else {
+        let q = pending.get(f.connId);
+        if (!q) { q = []; pending.set(f.connId, q); }
+        q.push(f.payload);
       }
+    } else if (f.type === FRAME_CLOSE) {
+      const target = targets.get(f.connId);
+      if (target) target.end();
+      targets.delete(f.connId);
+      pending.delete(f.connId);
     }
-  });
+  };
 
-  ctrl.on("close", () => {
+  ws.onclose = () => {
     console.log(`[${now()}] client disconnected from server`);
-    proxyConns.forEach((p) => p.destroy());
-    proxyConns.clear();
+    targets.forEach((t) => t.destroy());
+    targets.clear();
     pending.clear();
-  });
-  ctrl.on("error", (e: Error) => console.error(`[${now()}] client error:`, e.message));
+  };
+
+  ws.onerror = () => {};
 }

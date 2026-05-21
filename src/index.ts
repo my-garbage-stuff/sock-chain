@@ -1,16 +1,14 @@
-// ── Sock-Chain: raw SOCKS5 relay ──
-// Server:  opens port 1080, relays raw TCP bytes to client
-// Client:  starts a local SOCKS5 proxy, connects to server,
-//          forwards relayed bytes through its SOCKS5 proxy
+// ── Sock-Chain: raw SOCKS5 relay over WebSocket ──
+// Server:  opens port 1080, relays SOCKS5 traffic to client via WebSocket
+// Client:  connects to server via WebSocket, directly connects to targets
 // Users:   connect to server:1080 as a SOCKS5 proxy
 
 import { startServer } from "./server";
 import { startClient } from "./client";
-import { startSocks5Proxy } from "./socks5";
 import { config } from "./config";
 
 function usage() {
-  console.log(`sock-chain — raw SOCKS5 relay
+  console.log(`sock-chain — SOCKS5 relay over WebSocket
 
 USAGE
   sock-chain [--server] [options]
@@ -20,12 +18,10 @@ MODES
 
 SERVER OPTIONS
   --port <n>              Forward port (default: ${config.server.port})
-  --control-port <n>      Client control port (default: ${config.server.controlPort})
+  --control-port <n>      Client WebSocket port (default: ${config.server.controlPort})
 
 CLIENT OPTIONS
-  --server-host <host>    Server address (default: ${config.client.serverHost})
-  --server-port <n>       Server control port (default: ${config.client.serverPort})
-  --proxy-port <n>        Local SOCKS5 proxy port (default: ${config.client.proxyPort})
+  --connect <url>         Server WebSocket URL (default: ${config.client.serverAddress})
 
 CONFIG
   Edit src/config.ts to change all defaults. CLI flags override.
@@ -47,10 +43,6 @@ if (isServer) {
   const controlPort = parseInt(arg("--control-port") || String(config.server.controlPort));
   startServer(listenPort, controlPort);
 } else {
-  const serverHost = arg("--server-host") || config.client.serverHost;
-  const serverPort = parseInt(arg("--server-port") || String(config.client.serverPort));
-  const proxyPort = parseInt(arg("--proxy-port") || String(config.client.proxyPort));
-  startSocks5Proxy(proxyPort).then((actualProxyPort) => {
-    startClient(serverHost, serverPort, actualProxyPort);
-  });
+  const serverAddress = arg("--connect") || config.client.serverAddress;
+  startClient(serverAddress);
 }

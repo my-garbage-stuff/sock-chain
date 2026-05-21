@@ -30,8 +30,20 @@ export function frameHeader(connId: number, type: number, payloadLen: number): B
   return h;
 }
 
-export function writeFrame(sock: net.Socket, connId: number, type: number, payload: Buffer): boolean {
+export function tcpWriteFrame(sock: net.Socket, connId: number, type: number, payload: Buffer): boolean {
   return sock.write(Buffer.concat([frameHeader(connId, type, payload.length), payload]));
+}
+
+export function wsWriteFrame(ws: { send: (data: Buffer) => void }, connId: number, type: number, payload: Buffer): void {
+  ws.send(Buffer.concat([frameHeader(connId, type, payload.length), payload]));
+}
+
+export function parseFrame(data: Buffer): { connId: number; type: number; payload: Buffer } {
+  return {
+    connId: data.readUInt32BE(0),
+    type: data[4]!,
+    payload: data.subarray(HDR_SIZE),
+  };
 }
 
 export class FrameStream {
@@ -53,8 +65,6 @@ export class FrameStream {
     }
     return frames;
   }
-
-  reset() { this.buf = Buffer.alloc(0); }
 }
 
 export function now(): string {
@@ -81,4 +91,21 @@ export function socks5Reply(rep: number): Buffer {
   b[0] = SOCKS_VERSION; b[1] = rep; b[2] = 0x00; b[3] = ATYP_IPV4;
   b.writeUInt32BE(0, 4); b.writeUInt16BE(0, 8);
   return b;
+}
+
+export function socks5TargetAddr(atyp: number, buf: Buffer, offset: number): Buffer {
+  if (atyp === ATYP_IPV4) {
+    const a = Buffer.alloc(7);
+    a[0] = ATYP_IPV4;
+    buf.copy(a, 1, offset + 1, offset + 5);
+    a.writeUInt16BE(buf.readUInt16BE(offset + 5), 5);
+    return a;
+  }
+  const len = buf[offset + 1]!;
+  const a = Buffer.alloc(4 + len);
+  a[0] = ATYP_DOMAIN;
+  a[1] = len;
+  buf.copy(a, 2, offset + 2, offset + 2 + len);
+  a.writeUInt16BE(buf.readUInt16BE(offset + 2 + len), 2 + len);
+  return a;
 }
