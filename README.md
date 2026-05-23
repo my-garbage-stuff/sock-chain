@@ -20,7 +20,7 @@ Multiple clients can connect to one server. Each user connection is randomly ass
 sock-chain --server
 
 # Client (connects to server, runs internal SOCKS5 proxy)
-sock-chain --server-host example.com --server-port 2080
+sock-chain --connect wss://example.com
 
 # Test the chain
 curl --socks5 127.0.0.1:1080 http://httpbin.org/ip
@@ -33,8 +33,8 @@ With multiple clients:
 sock-chain --server --port 1080 --control-port 2080
 
 # Terminal 2 and 3
-sock-chain --server-host myserver.com
-sock-chain --server-host myserver.com
+sock-chain --connect wss://myserver.com
+sock-chain --connect wss://myserver.com
 ```
 
 ## Build
@@ -46,7 +46,7 @@ bun build src/index.ts --compile --outfile=sock-chain
 ## Configuration
 
 Edit `src/config.ts` to change default `serverHost` and `serverPort` for client mode.
-These are compiled into the binary. CLI flags (`--server-host`, `--server-port`) override them.
+These are compiled into the binary. CLI flags (`--connect`, `--server-port`) override them.
 
 ```ts
 export const config = {

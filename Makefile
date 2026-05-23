@@ -1,19 +1,9 @@
 # Build with bun (produces a native executable)
-SRC := ./src/index.ts
+all: clean build
 
-TARGET := linux-x86_64 windows-x64
-
-.PHONY: build
-
-build: $(TARGET)
-
-bun-install:
-	bun install
-
-$(TARGET): bun-install $(SRC)
+build:
 	mkdir -p $(dir $@)
 	# Build a single-file native binary with bun
-	bun build $(SRC) --outfile=dist/sock5-chain-$@ --compile --target=bun-$@
-
+	bun ./build.ts
 clean:
 	rm -rf dist node_modules bun.lock
