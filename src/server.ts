@@ -4,8 +4,8 @@ import { listen } from "bun";
 import { config } from "./config";
 import {
   FRAME_CONNECT, FRAME_DATA, FRAME_CLOSE, FRAME_META,
-  CLIENT_MAGIC,
-  bunWriteFrame, FrameStream, now, randomUUID,
+  CLIENT_MAGIC, HDR_SIZE,
+  bunWriteFrame, frameHeader, FrameStream, now, randomUUID,
   tryParseConnect, makeConnectResponse, encodeTargetAddr,
 } from "./utils";
 
@@ -24,6 +24,7 @@ interface UserState {
   sock: any;
   connId: number;
   client: any;
+  pending: Buffer[];
 }
 
 function makeClientsJS(clients: Map<any, ClientState>, clientConns: Map<number, any>): string {
@@ -66,6 +67,35 @@ export function startServer(listenPort: number) {
     clientConns.delete(connId);
   }
 
+  function flushUserPending(user: UserState) {
+    while (user.pending.length > 0) {
+      const buf = user.pending[0];
+      let written: number;
+      try { written = user.sock.write(buf); } catch { user.pending.length = 0; return; }
+      if (written < buf.length) {
+        user.pending[0] = buf.subarray(written);
+        return;
+      }
+      user.pending.shift();
+    }
+  }
+
+  function flushClientPending(st: ClientState, sock: any) {
+    for (const [connId, q] of st.userQueues) {
+      while (q.length > 0) {
+        const buf = q[0];
+        let written: number;
+        try { written = sock.write(buf); } catch { q.length = 0; st.userQueues.delete(connId); break; }
+        if (written < buf.length) {
+          q[0] = buf.subarray(written);
+          return;
+        }
+        q.shift();
+      }
+      st.userQueues.delete(connId);
+    }
+  }
+
   console.log(`[${now()}] server listening on ${listenPort}`);
 
   listen({
@@ -86,7 +116,15 @@ export function startServer(listenPort: number) {
             if (f.type === FRAME_DATA) {
               const user = users.get(f.connId);
               if (!user) continue;
-              try { user.sock.write(f.payload); } catch {}
+              if (user.pending.length > 0) {
+                user.pending.push(f.payload);
+              } else {
+                let written: number;
+                try { written = user.sock.write(f.payload); } catch { closeConnection(f.connId); continue; }
+                if (written < f.payload.length) {
+                  user.pending.push(f.payload.subarray(written));
+                }
+              }
             } else if (f.type === FRAME_CLOSE) {
               closeConnection(f.connId);
             } else if (f.type === FRAME_META) {
@@ -100,7 +138,20 @@ export function startServer(listenPort: number) {
         } else if (d.role === "user") {
           const user = users.get(d.connId);
           if (!user || !user.client) return;
-          bunWriteFrame(user.client, d.connId, FRAME_DATA, data);
+          const st = clients.get(user.client);
+          if (!st) return;
+          const q = st.userQueues.get(d.connId);
+          const frame = Buffer.concat([frameHeader(d.connId, FRAME_DATA, data.length), data]);
+          if (q) {
+            q.push(frame);
+          } else {
+            let written: number;
+            try { written = user.client.write(frame); } catch { closeConnection(d.connId); return; }
+            if (written < frame.length) {
+              const nq = [frame.subarray(written)];
+              st.userQueues.set(d.connId, nq);
+            }
+          }
         } else {
           // Determine role from first data
           if (data.length >= 4 && data.subarray(0, 4).equals(CLIENT_MAGIC)) {
@@ -135,29 +186,31 @@ export function startServer(listenPort: number) {
             }
           } else {
             d.buf = Buffer.concat([d.buf, data]);
-            if (d.buf.length >= 4 && d.buf.subarray(0, 4).toString() === "GET ") {
-              const eom = d.buf.indexOf(Buffer.from("\r\n\r\n"));
-              if (eom !== -1) {
-                const reqLine = d.buf.subarray(0, d.buf.indexOf(Buffer.from("\r\n"))).toString();
-                if (reqLine === "GET /clients HTTP/1.1" || reqLine === "GET /clients HTTP/1.0") {
-                  const json = makeClientsJS(clients, clientConns);
-                  const body = Buffer.from(json);
-                  const resp = Buffer.concat([
-                    Buffer.from("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n"),
-                    body,
-                  ]);
-                  try { sock.write(resp); } catch {}
-                }
-                sock.end();
-                return;
-              }
-              if (d.buf.length > 65536) sock.end();
-              return;
-            }
 
             // HTTP CONNECT
             const parsed = tryParseConnect(d.buf);
             if (!parsed) {
+              if (d.buf.length >= 4 && d.buf.subarray(0, 4).toString() === "GET ") {
+                const eom = d.buf.indexOf(Buffer.from("\r\n\r\n"));
+                if (eom !== -1) {
+                  const reqLine = d.buf.subarray(0, d.buf.indexOf(Buffer.from("\r\n"))).toString();
+                  if (reqLine === "GET /clients HTTP/1.1" || reqLine === "GET /clients HTTP/1.0") {
+                    const json = makeClientsJS(clients, clientConns);
+                    const body = Buffer.from(json);
+                    const resp = Buffer.concat([
+                      Buffer.from("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n"),
+                      body,
+                    ]);
+                    try { sock.write(resp); } catch {}
+                  } else {
+                    try { sock.write(Buffer.from("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")); } catch {}
+                  }
+                  sock.end();
+                  return;
+                }
+                if (d.buf.length > 65536) sock.end();
+                return;
+              }
               if (d.buf.length > 65536) sock.end();
               return;
             }
@@ -186,6 +239,7 @@ export function startServer(listenPort: number) {
               sock,
               connId,
               client: c,
+              pending: [],
             };
             users.set(connId, userState);
             clientConns.set(connId, c);
@@ -196,6 +250,17 @@ export function startServer(listenPort: number) {
               bunWriteFrame(c, connId, FRAME_DATA, leftover);
             }
           }
+        }
+      },
+      drain(sock) {
+        const d: any = sock.data;
+        if (!d) return;
+        if (d.role === "user") {
+          const user = users.get(d.connId);
+          if (user) flushUserPending(user);
+        } else if (d.role === "client") {
+          const st = clients.get(sock);
+          if (st) flushClientPending(st, sock);
         }
       },
       close(sock) {
