@@ -4,8 +4,8 @@ import { listen } from "bun";
 import { config } from "./config";
 import {
   FRAME_CONNECT, FRAME_DATA, FRAME_CLOSE, FRAME_META,
-  CLIENT_MAGIC, HDR_SIZE,
-  bunWriteFrame, frameHeader, FrameStream, now, randomUUID,
+  CLIENT_MAGIC,
+  frameHeader, FrameStream, now, randomUUID,
   tryParseConnect, makeConnectResponse, encodeTargetAddr,
 } from "./utils";
 
@@ -18,6 +18,7 @@ interface ClientState {
   connectedAt: string;
   id: number;
   uuid: string;
+  sock: any;
 }
 
 interface UserState {
@@ -54,6 +55,23 @@ export function startServer(listenPort: number) {
       return pool.find(c => clients.get(c)!.uuid === uuid) || null;
     }
     return pool[Math.floor(Math.random() * pool.length)]!;
+  }
+
+  function writeClientFrame(st: ClientState, connId: number, type: number, payload: Buffer) {
+    const frame = Buffer.concat([frameHeader(connId, type, payload.length), payload]);
+    if (st.userQueues.size > 0) {
+      let q = st.userQueues.get(connId);
+      if (!q) { q = []; st.userQueues.set(connId, q); }
+      q.push(frame);
+      return;
+    }
+    let written: number;
+    try { written = st.sock.write(frame); } catch { return; }
+    if (written < frame.length) {
+      let q = st.userQueues.get(connId);
+      if (!q) { q = []; st.userQueues.set(connId, q); }
+      q.push(frame.subarray(written));
+    }
   }
 
   function closeConnection(connId: number) {
@@ -140,18 +158,7 @@ export function startServer(listenPort: number) {
           if (!user || !user.client) return;
           const st = clients.get(user.client);
           if (!st) return;
-          const q = st.userQueues.get(d.connId);
-          const frame = Buffer.concat([frameHeader(d.connId, FRAME_DATA, data.length), data]);
-          if (q) {
-            q.push(frame);
-          } else {
-            let written: number;
-            try { written = user.client.write(frame); } catch { closeConnection(d.connId); return; }
-            if (written < frame.length) {
-              const nq = [frame.subarray(written)];
-              st.userQueues.set(d.connId, nq);
-            }
-          }
+          writeClientFrame(st, d.connId, FRAME_DATA, data);
         } else {
           // Determine role from first data
           if (data.length >= 4 && data.subarray(0, 4).equals(CLIENT_MAGIC)) {
@@ -167,6 +174,7 @@ export function startServer(listenPort: number) {
               connectedAt: new Date().toISOString(),
               userQueues: new Map(),
               fs,
+              sock,
             };
             d.role = "client";
             clients.set(sock, info);
@@ -228,13 +236,6 @@ export function startServer(listenPort: number) {
             d.role = "user";
             d.connId = connId;
 
-            const addrPayload = encodeTargetAddr(host, port);
-            bunWriteFrame(c, connId, FRAME_CONNECT, addrPayload);
-            try { sock.write(makeConnectResponse()); } catch {}
-
-            const eoh = d.buf.indexOf(Buffer.from("\r\n\r\n"));
-            const leftover = eoh !== -1 ? d.buf.subarray(eoh + 4) : Buffer.alloc(0);
-
             const userState: UserState = {
               sock,
               connId,
@@ -243,11 +244,22 @@ export function startServer(listenPort: number) {
             };
             users.set(connId, userState);
             clientConns.set(connId, c);
-            const usedUUID = clients.get(c)?.uuid ?? "?";
+
+            const st = clients.get(c);
+            if (st) {
+              const addrPayload = encodeTargetAddr(host, port);
+              writeClientFrame(st, connId, FRAME_CONNECT, addrPayload);
+            }
+            try { sock.write(makeConnectResponse()); } catch {}
+
+            const eoh = d.buf.indexOf(Buffer.from("\r\n\r\n"));
+            const leftover = eoh !== -1 ? d.buf.subarray(eoh + 4) : Buffer.alloc(0);
+
+            const usedUUID = st?.uuid ?? "?";
             console.log(`[${now()}] [+] conn#${connId} ${host}:${port} \u2192 ${usedUUID.slice(0, 8)} (${users.size} active)`);
 
-            if (leftover.length > 0) {
-              bunWriteFrame(c, connId, FRAME_DATA, leftover);
+            if (leftover.length > 0 && st) {
+              writeClientFrame(st, connId, FRAME_DATA, leftover);
             }
           }
         }
@@ -276,10 +288,10 @@ export function startServer(listenPort: number) {
         } else if (d?.role === "user") {
           const user = users.get(d.connId);
           if (user) {
-            bunWriteFrame(user.client, d.connId, FRAME_CLOSE, Buffer.alloc(0));
+            const st = clients.get(user.client);
+            if (st) writeClientFrame(st, d.connId, FRAME_CLOSE, Buffer.alloc(0));
             users.delete(d.connId);
             clientConns.delete(d.connId);
-            const st = clients.get(user.client);
             if (st) st.userQueues.delete(d.connId);
           }
         }

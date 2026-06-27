@@ -29,10 +29,6 @@ export function tcpWriteFrame(sock: net.Socket, connId: number, type: number, pa
   return sock.write(Buffer.concat([frameHeader(connId, type, payload.length), payload]));
 }
 
-export function bunWriteFrame(sock: { write: (d: Buffer) => number }, connId: number, type: number, payload: Buffer): void {
-  sock.write(Buffer.concat([frameHeader(connId, type, payload.length), payload]));
-}
-
 // ── Frame parsing ──
 
 export interface Frame {
@@ -78,14 +74,29 @@ export function now(): string {
 // ── Target address encoding (SOCKS5-style) ──
 
 export function parseAddress(buf: Buffer, offset = 0) {
+  if (offset + 1 > buf.length) {
+    return { addr: "0.0.0.0", port: 0 };
+  }
   const atyp = buf[offset]!;
   if (atyp === 0x01) {
+    if (offset + 7 > buf.length) return { addr: "0.0.0.0", port: 0 };
     return {
       addr: Array.from(buf.slice(offset + 1, offset + 5)).join("."),
       port: buf.readUInt16BE(offset + 5),
     };
   }
+  if (atyp === 0x04) {
+    if (offset + 19 > buf.length) return { addr: "::", port: 0 };
+    const hextets: string[] = [];
+    for (let i = 0; i < 8; i++) hextets.push(buf.readUInt16BE(offset + 1 + i * 2).toString(16));
+    return {
+      addr: hextets.join(":"),
+      port: buf.readUInt16BE(offset + 17),
+    };
+  }
+  if (offset + 2 > buf.length) return { addr: "", port: 0 };
   const len = buf[offset + 1]!;
+  if (offset + 2 + len + 2 > buf.length) return { addr: "", port: 0 };
   return {
     addr: buf.slice(offset + 2, offset + 2 + len).toString(),
     port: buf.readUInt16BE(offset + 2 + len),
@@ -93,13 +104,21 @@ export function parseAddress(buf: Buffer, offset = 0) {
 }
 
 export function encodeTargetAddr(host: string, port: number): Buffer {
-  const ipv4 = net.isIPv4(host);
-  if (ipv4) {
+  const clean = host.replace(/^\[([^\]]+)\]$/, "$1");
+  if (net.isIPv4(clean)) {
     const a = Buffer.alloc(7);
     a[0] = 0x01;
-    const parts = host.split(".").map(Number);
+    const parts = clean.split(".").map(Number);
     a[1] = parts[0]!; a[2] = parts[1]!; a[3] = parts[2]!; a[4] = parts[3]!;
     a.writeUInt16BE(port, 5);
+    return a;
+  }
+  if (net.isIPv6(clean)) {
+    const a = Buffer.alloc(19);
+    a[0] = 0x04;
+    const parts = clean.split(":").map(s => parseInt(s, 16) || 0);
+    for (let i = 0; i < 8; i++) a.writeUInt16BE(parts[i] || 0, 1 + i * 2);
+    a.writeUInt16BE(port, 17);
     return a;
   }
   const hostB = Buffer.from(host, "utf8");

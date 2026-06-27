@@ -5,13 +5,15 @@ import * as os from "os";
 import {
   FRAME_CONNECT, FRAME_DATA, FRAME_CLOSE, FRAME_META,
   CLIENT_MAGIC,
-  toBuf, tcpWriteFrame, FrameStream, now, parseAddress,
+  toBuf, frameHeader, FrameStream, now, parseAddress,
 } from "./utils";
 import { config } from "./config";
 
 export function startClient(serverAddress: string) {
   const targets = new Map<number, net.Socket>();
   const pending = new Map<number, Buffer[]>();
+  const serverQueue: Buffer[] = [];
+  let serverSock: net.Socket | null = null;
   let closing = false;
   let retryDelay = config.client.reconnectDelay;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -20,6 +22,19 @@ export function startClient(serverAddress: string) {
     targets.forEach((t) => t.destroy());
     targets.clear();
     pending.clear();
+    serverQueue.length = 0;
+  }
+
+  // Write framed data to server socket, queuing on backpressure
+  function writeServerFrame(connId: number, type: number, payload: Buffer) {
+    const frame = Buffer.concat([frameHeader(connId, type, payload.length), payload]);
+    if (serverQueue.length > 0 || !serverSock) {
+      serverQueue.push(frame);
+      return;
+    }
+    if (!serverSock.write(frame)) {
+      serverQueue.push(frame);
+    }
   }
 
   // Write data to target socket, queueing on backpressure
@@ -78,8 +93,9 @@ export function startClient(serverAddress: string) {
         runtime: process.version,
       });
       sock.write(CLIENT_MAGIC);
-      tcpWriteFrame(sock, 0, FRAME_META, Buffer.from(meta));
+      writeServerFrame(0, FRAME_META, Buffer.from(meta));
     });
+    serverSock = sock;
 
     const fs = new FrameStream();
 
@@ -89,26 +105,30 @@ export function startClient(serverAddress: string) {
         if (f.type === FRAME_CONNECT) {
           const { addr, port: targetPort } = parseAddress(f.payload, 0);
           const target = net.createConnection({ host: addr, port: targetPort }, () => {
-            target.setTimeout(0);
             const q = pending.get(f.connId);
             if (q) {
-              for (const chunk of q) target.write(chunk);
               pending.delete(f.connId);
+              for (const chunk of q) {
+                writeWithBackpressure(f.connId, chunk, target);
+              }
             }
             target.on("data", (pd: Buffer) => {
-              tcpWriteFrame(sock, f.connId, FRAME_DATA, toBuf(pd));
+              writeServerFrame(f.connId, FRAME_DATA, toBuf(pd));
             });
             target.on("close", () => {
-              tcpWriteFrame(sock, f.connId, FRAME_CLOSE, Buffer.alloc(0));
+              writeServerFrame(f.connId, FRAME_CLOSE, Buffer.alloc(0));
               targets.delete(f.connId);
             });
-            target.on("error", () => {});
+            target.on("error", () => {
+              targets.delete(f.connId);
+              pending.delete(f.connId);
+            });
           });
           target.on("error", (e: Error) => {
             console.log(`[${now()}] target#${f.connId} ${addr}:${targetPort}: ${e.message}`);
             pending.delete(f.connId);
             targets.delete(f.connId);
-            tcpWriteFrame(sock, f.connId, FRAME_CLOSE, Buffer.alloc(0));
+            writeServerFrame(f.connId, FRAME_CLOSE, Buffer.alloc(0));
           });
           targets.set(f.connId, target);
         } else if (f.type === FRAME_DATA) {
@@ -129,8 +149,18 @@ export function startClient(serverAddress: string) {
       }
     });
 
+    sock.on("drain", () => {
+      while (serverQueue.length > 0) {
+        if (!sock.write(serverQueue[0]!)) {
+          return;
+        }
+        serverQueue.shift();
+      }
+    });
+
     sock.on("close", () => {
       console.log(`[${now()}] client disconnected from server`);
+      serverSock = null;
       cleanup();
       if (!closing) {
         console.log(`[${now()}] reconnecting in ${retryDelay}ms`);
