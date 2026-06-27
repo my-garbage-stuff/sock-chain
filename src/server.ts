@@ -1,248 +1,225 @@
-import * as net from "net";
-import { serve } from "bun";
+// Server: accepts HTTP CONNECT users and routes traffic to connected clients via framed TCP.
+
+import { listen } from "bun";
 import { config } from "./config";
 import {
   FRAME_CONNECT, FRAME_DATA, FRAME_CLOSE, FRAME_META,
-  toBuf, wsWriteFrame, parseFrame, now,
-  parseAddress, socks5Reply, socks5TargetAddr,
-  SOCKS_VERSION, METHOD_NO_AUTH, CMD_CONNECT,
-  ATYP_IPV4,
-  REP_SUCCEEDED, REP_GENERAL_FAILURE,
+  CLIENT_MAGIC,
+  bunWriteFrame, FrameStream, now, randomUUID,
+  tryParseConnect, makeConnectResponse, encodeTargetAddr,
 } from "./utils";
 
 interface ClientState {
   userQueues: Map<number, Buffer[]>;
-}
-
-interface ClientInfo {
-  id: number;
-  ip: string;
+  fs: FrameStream;
   hostname: string;
   platform: string;
+  ip: string;
   connectedAt: string;
-  [key: string]: unknown;
+  id: number;
+  uuid: string;
 }
 
-export function startServer(listenPort: number, controlPort: number) {
+interface UserState {
+  sock: any;
+  connId: number;
+  client: any;
+}
+
+function makeClientsJS(clients: Map<any, ClientState>, clientConns: Map<number, any>): string {
+  const list = Array.from(clients.entries()).map(([sock, info]) => ({
+    id: info.id,
+    uuid: info.uuid,
+    ip: info.ip,
+    hostname: info.hostname,
+    platform: info.platform,
+    connectedAt: info.connectedAt,
+    connections: Array.from(clientConns.values()).filter(c => c === sock).length,
+  }));
+  return JSON.stringify(list);
+}
+
+export function startServer(listenPort: number) {
   const clients = new Map<any, ClientState>();
-  const clientInfo = new Map<any, ClientInfo>();
   const clientConns = new Map<number, any>();
-  const users = new Map<number, net.Socket>();
-  const userDraining = new Set<net.Socket>();
+  const users = new Map<number, UserState>();
   let nextConnId = 1;
   let nextClientId = 1;
 
-  function pickClient(): any | null {
+  function pickClient(uuid?: string): any | null {
     const pool = Array.from(clients.keys());
     if (pool.length === 0) return null;
+    if (uuid) {
+      return pool.find(c => clients.get(c)!.uuid === uuid) || null;
+    }
     return pool[Math.floor(Math.random() * pool.length)]!;
   }
 
-  function flushUser(connId: number, q: Buffer[]) {
+  function closeConnection(connId: number) {
     const user = users.get(connId);
-    if (!user) return;
-    while (q.length > 0) {
-      if (!user.write(q[0]!)) {
-        if (!userDraining.has(user)) {
-          userDraining.add(user);
-          user.once("drain", () => {
-            userDraining.delete(user);
-            flushUser(connId, q);
-          });
-        }
-        return;
-      }
-      q.shift();
+    if (user) {
+      try { user.sock.end(); } catch {}
+      const st = clients.get(user.client);
+      if (st) st.userQueues.delete(connId);
     }
+    users.delete(connId);
+    clientConns.delete(connId);
   }
 
-  // Control channel — WebSocket
-  serve({
-    port: controlPort,
-    fetch(req, server) {
-      const url = new URL(req.url);
+  console.log(`[${now()}] server listening on ${listenPort}`);
 
-      if (url.pathname === "/clients") {
-        const list = Array.from(clientInfo.entries()).map(([ws, info]) => ({
-          ...info,
-          connections: Array.from(clientConns.values()).filter(c => c === ws).length,
-        }));
-        return new Response(JSON.stringify(list, null, 2), {
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-
-      const ip = server.requestIP(req)?.address || "unknown";
-
-      if (server.upgrade(req, { data: { ip } })) return;
-      const list = Array.from(clientInfo.entries()).map(([ws, info]) => ({
-        ...info,
-        connections: Array.from(clientConns.values()).filter(c => c === ws).length,
-      }));
-      return new Response(JSON.stringify(list, null, 2), {
-        status: 426,
-        headers: { "Content-Type": "application/json" },
-      });
-    },
-    websocket: {
-      pingInterval: config.server.pingInterval,
-      open(ws) {
-        const info: ClientInfo = {
-          id: nextClientId++,
-          ip: ws.data.ip,
-          hostname: "unknown",
-          platform: "unknown",
-          connectedAt: new Date().toISOString(),
-        };
-        clientInfo.set(ws, info);
-        clients.set(ws, { userQueues: new Map() });
-        console.log(`[${now()}] [+] client #${info.id} ${info.ip} (${clients.size} connected)`);
+  listen({
+    hostname: "0.0.0.0",
+    port: listenPort,
+    socket: {
+      open(sock) {
+        sock.data = { role: null as string | null, buf: Buffer.alloc(0) };
       },
-      message(ws, data) {
-        if (typeof data === "string") return;
-        const f = parseFrame(data);
+      data(sock, data) {
+        const d: any = sock.data;
 
-        if (f.type === FRAME_DATA) {
-          const user = users.get(f.connId);
-          if (!user || user.destroyed) return;
-          if (!user.write(f.payload)) {
-            let q = clients.get(ws)?.userQueues.get(f.connId);
-            if (!q) {
-              q = [];
-              const st = clients.get(ws);
-              if (st) st.userQueues.set(f.connId, q);
-            }
-            q.push(f.payload);
-            if (!userDraining.has(user)) {
-              userDraining.add(user);
-              user.once("drain", () => {
-                userDraining.delete(user);
-                flushUser(f.connId, q);
-              });
+        if (d.role === "client") {
+          const st = clients.get(sock);
+          if (!st) return;
+          const frames = st.fs.push(data);
+          for (const f of frames) {
+            if (f.type === FRAME_DATA) {
+              const user = users.get(f.connId);
+              if (!user) continue;
+              try { user.sock.write(f.payload); } catch {}
+            } else if (f.type === FRAME_CLOSE) {
+              closeConnection(f.connId);
+            } else if (f.type === FRAME_META) {
+              try {
+                const meta = JSON.parse(f.payload.toString());
+                st.hostname = meta.hostname ?? st.hostname;
+                st.platform = meta.platform ?? st.platform;
+              } catch {}
             }
           }
-        } else if (f.type === FRAME_CLOSE) {
-          const user = users.get(f.connId);
-          if (user) user.end();
-          users.delete(f.connId);
-          clientConns.delete(f.connId);
-          const st = clients.get(ws);
-          if (st) st.userQueues.delete(f.connId);
-        } else if (f.type === FRAME_META) {
-          const info = clientInfo.get(ws);
-          if (info) {
-            try {
-              const meta = JSON.parse(f.payload.toString());
-              delete meta.id;
-              delete meta.ip;
-              delete meta.connectedAt;
-              Object.assign(info, meta);
-            } catch {}
+        } else if (d.role === "user") {
+          const user = users.get(d.connId);
+          if (!user || !user.client) return;
+          bunWriteFrame(user.client, d.connId, FRAME_DATA, data);
+        } else {
+          // Determine role from first data
+          if (data.length >= 4 && data.subarray(0, 4).equals(CLIENT_MAGIC)) {
+            const fs = new FrameStream();
+            let clientIp = "";
+            try { clientIp = (sock.remoteAddress || "").replace("::ffff:", ""); } catch {}
+            const info: ClientState = {
+              id: nextClientId++,
+              uuid: randomUUID(),
+              ip: clientIp,
+              hostname: "unknown",
+              platform: "unknown",
+              connectedAt: new Date().toISOString(),
+              userQueues: new Map(),
+              fs,
+            };
+            d.role = "client";
+            clients.set(sock, info);
+            console.log(`[${now()}] [+] client #${info.id} ${info.uuid.slice(0, 8)} ${clientIp} (${clients.size} connected)`);
+            const leftover = data.subarray(4);
+            if (leftover.length > 0) {
+              const frames = fs.push(leftover);
+              for (const f of frames) {
+                if (f.type === FRAME_META) {
+                  try {
+                    const meta = JSON.parse(f.payload.toString());
+                    info.hostname = meta.hostname ?? info.hostname;
+                    info.platform = meta.platform ?? info.platform;
+                  } catch {}
+                }
+              }
+            }
+          } else {
+            d.buf = Buffer.concat([d.buf, data]);
+            if (d.buf.length >= 4 && d.buf.subarray(0, 4).toString() === "GET ") {
+              const eom = d.buf.indexOf(Buffer.from("\r\n\r\n"));
+              if (eom !== -1) {
+                const reqLine = d.buf.subarray(0, d.buf.indexOf(Buffer.from("\r\n"))).toString();
+                if (reqLine === "GET /clients HTTP/1.1" || reqLine === "GET /clients HTTP/1.0") {
+                  const json = makeClientsJS(clients, clientConns);
+                  const body = Buffer.from(json);
+                  const resp = Buffer.concat([
+                    Buffer.from("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + body.length + "\r\nConnection: close\r\n\r\n"),
+                    body,
+                  ]);
+                  try { sock.write(resp); } catch {}
+                }
+                sock.end();
+                return;
+              }
+              if (d.buf.length > 65536) sock.end();
+              return;
+            }
+
+            // HTTP CONNECT
+            const parsed = tryParseConnect(d.buf);
+            if (!parsed) {
+              if (d.buf.length > 65536) sock.end();
+              return;
+            }
+            const { host, port, uuid } = parsed;
+
+            const c = pickClient(uuid);
+            if (!c) {
+              try { sock.write(Buffer.from("HTTP/1.1 503 Service Unavailable\r\n\r\n")); } catch {}
+              sock.end();
+              console.log(`[${now()}] no clients, rejected ${host}:${port}`);
+              return;
+            }
+
+            const connId = nextConnId++;
+            d.role = "user";
+            d.connId = connId;
+
+            const addrPayload = encodeTargetAddr(host, port);
+            bunWriteFrame(c, connId, FRAME_CONNECT, addrPayload);
+            try { sock.write(makeConnectResponse()); } catch {}
+
+            const eoh = d.buf.indexOf(Buffer.from("\r\n\r\n"));
+            const leftover = eoh !== -1 ? d.buf.subarray(eoh + 4) : Buffer.alloc(0);
+
+            const userState: UserState = {
+              sock,
+              connId,
+              client: c,
+            };
+            users.set(connId, userState);
+            clientConns.set(connId, c);
+            const usedUUID = clients.get(c)?.uuid ?? "?";
+            console.log(`[${now()}] [+] conn#${connId} ${host}:${port} \u2192 ${usedUUID.slice(0, 8)} (${users.size} active)`);
+
+            if (leftover.length > 0) {
+              bunWriteFrame(c, connId, FRAME_DATA, leftover);
+            }
           }
         }
       },
-      close(ws) {
-        const info = clientInfo.get(ws);
-        if (info) console.log(`[${now()}] [-] client #${info.id} ${info.ip} (${clients.size - 1} connected)`);
-        else console.log(`[${now()}] [-] client (${clients.size - 1} connected)`);
-        clientInfo.delete(ws);
-        clients.delete(ws);
-        for (const [connId, cs] of clientConns) {
-          if (cs === ws) {
-            const user = users.get(connId);
-            if (user) user.end();
-            users.delete(connId);
-            clientConns.delete(connId);
+      close(sock) {
+        const d: any = sock.data;
+        if (d?.role === "client") {
+          const info = clients.get(sock);
+          if (info) console.log(`[${now()}] [-] client #${info.id} (${clients.size - 1} connected)`);
+          else console.log(`[${now()}] [-] client (${clients.size - 1} connected)`);
+          clients.delete(sock);
+          for (const [connId, cs] of clientConns) {
+            if (cs === sock) closeConnection(connId);
+          }
+        } else if (d?.role === "user") {
+          const user = users.get(d.connId);
+          if (user) {
+            bunWriteFrame(user.client, d.connId, FRAME_CLOSE, Buffer.alloc(0));
+            users.delete(d.connId);
+            clientConns.delete(d.connId);
+            const st = clients.get(user.client);
+            if (st) st.userQueues.delete(d.connId);
           }
         }
       },
+      error(_sock, _err) {},
     },
   });
-  console.log(`[${now()}] server control on ${controlPort}`);
-
-  // Forward port — users connect here (SOCKS5)
-  net.createServer((user) => {
-    const userAddr = `${user.remoteAddress}:${user.remotePort}`;
-    let buf = Buffer.alloc(0);
-    let step: "handshake" | "request" | "relay" = "handshake";
-    let connId = -1;
-    let c: any = null;
-
-    function onData(d: string | Buffer) {
-      buf = Buffer.concat([buf, toBuf(d)]);
-
-      if (step === "handshake") {
-        if (buf.length < 3) return;
-        const nmethods = buf[1]!;
-        const greetingLen = 2 + nmethods;
-        if (buf.length < greetingLen) return;
-        if (buf[0] !== SOCKS_VERSION) { user.end(); return; }
-        user.write(Buffer.from([SOCKS_VERSION, METHOD_NO_AUTH]));
-        buf = buf.subarray(greetingLen);
-        step = "request";
-      }
-
-      if (step === "request") {
-        if (buf.length < 5) return;
-        if (buf[0] !== SOCKS_VERSION || buf[1] !== CMD_CONNECT) {
-          try { user.write(socks5Reply(0x07)); } catch {}
-          user.end();
-          return;
-        }
-        const atyp = buf[3]!;
-        let need: number;
-        if (atyp === ATYP_IPV4) need = 10;
-        else need = 7 + buf[4]!;
-        if (buf.length < need) return;
-
-        user.removeListener("data", onData);
-
-        try {
-          const { addr, port: targetPort } = parseAddress(buf, 3);
-          const leftover = buf.subarray(need);
-          const addrPayload = socks5TargetAddr(atyp, buf, 3);
-
-          c = pickClient();
-          if (!c) {
-            try { user.write(socks5Reply(REP_GENERAL_FAILURE)); } catch {}
-            user.end();
-            console.log(`[${now()}] no clients, rejected ${userAddr}`);
-            return;
-          }
-
-          connId = nextConnId++;
-          users.set(connId, user);
-          clientConns.set(connId, c);
-          console.log(`[${now()}] [+] conn#${connId} ${addr}:${targetPort} via ${userAddr} (${users.size} active)`);
-
-          wsWriteFrame(c, connId, FRAME_CONNECT, addrPayload);
-          try { user.write(socks5Reply(REP_SUCCEEDED)); } catch {}
-
-          if (leftover.length > 0) {
-            wsWriteFrame(c, connId, FRAME_DATA, leftover);
-          }
-
-          step = "relay";
-          user.on("data", (d2: string | Buffer) => {
-            wsWriteFrame(c, connId, FRAME_DATA, toBuf(d2));
-          });
-          user.on("close", () => {
-            console.log(`[${now()}] [-] conn#${connId} closed (${users.size - 1} active)`);
-            wsWriteFrame(c, connId, FRAME_CLOSE, Buffer.alloc(0));
-            users.delete(connId);
-            clientConns.delete(connId);
-            const st = clients.get(c);
-            if (st) st.userQueues.delete(connId);
-          });
-          user.on("error", () => {});
-        } catch {
-          try { user.write(socks5Reply(REP_GENERAL_FAILURE)); } catch {}
-          user.end();
-        }
-      }
-    }
-
-    user.on("data", onData);
-    user.on("error", () => {});
-  }).listen(listenPort, "0.0.0.0", () => console.log(`[${now()}] server forward on ${listenPort}`));
 }
